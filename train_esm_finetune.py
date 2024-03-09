@@ -367,7 +367,7 @@ def main(args):
                output_dir=args.output_dir,
                log_wandb=True,
                log_interval=args.log_interval)
-    print('Experiment ended')
+    logger.info('Training ended, start testing...')
 
     model_state, _ = load_model_checkpoint(os.path.join(args.output_dir, 'model_best.pth.tar'))
     model.load_state_dict(model_state)
@@ -377,7 +377,7 @@ def main(args):
     logger.info('Test: %s' % (test_metrics))
     if args.log_wandb:
         wandb.log(test_metrics)
-    print('Experiment ended')
+    logger.info('Experiment ended.')
 
 def train(model,
           loader,
