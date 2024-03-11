@@ -17,6 +17,16 @@ try:
 except ImportError:
     pass
 
+def print_trainable_parameters(model):
+  trainable_params = 0
+  all_param = 0
+  for _, param in model.named_parameters():
+    all_param += param.numel()
+    if param.requires_grad:
+      trainable_params += param.numel()
+
+  return (f"trainable params: {trainable_params} || all params: {all_param} "
+          f"|| trainable: {(100 * trainable_params / all_param)}")
 
 def get_outdir(path, *paths, inc=False):
     outdir = os.path.join(path, *paths)
@@ -54,17 +64,25 @@ def update_summary(epoch,
 def save_checkpoint(checkpoint_state, epoch, is_best, checkpoint_dir):
     if (not torch.distributed.is_initialized()
         ) or torch.distributed.get_rank() == 0:
-        filename = 'checkpoint_' + str(epoch) + '.pth'
-        file_path = os.path.join(checkpoint_dir, filename)
-        torch.save(checkpoint_state, file_path)
         if is_best:
-            shutil.copyfile(file_path,
-                            os.path.join(checkpoint_dir, 'model_best.pth.tar'))
+            torch.save(checkpoint_state, os.path.join(checkpoint_dir, 'model_best.pth.tar'))
+
+# def save_checkpoint(checkpoint_state, epoch, is_best, checkpoint_dir):
+#     if (not torch.distributed.is_initialized()
+#         ) or torch.distributed.get_rank() == 0:
+#         # filename = 'checkpoint_' + str(epoch) + '.pth'
+#         filename = 'checkpoint_last' + '.pth'
+#         file_path = os.path.join(checkpoint_dir, filename)
+#         torch.save(checkpoint_state, file_path)
+#         if is_best:
+#             shutil.copyfile(file_path,
+#                             os.path.join(checkpoint_dir, 'model_best.pth.tar'))
 
 def load_model_checkpoint(checkpoint_path):
     if os.path.isfile(checkpoint_path):
         print("=> loading checkpoint '{}'".format(checkpoint_path))
-        checkpoint = torch.load(checkpoint_path, map_location='cuda:0')
+        # 将模型加载到CPU上
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
         if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             model_state = OrderedDict()
             for k, v in checkpoint['state_dict'].items():

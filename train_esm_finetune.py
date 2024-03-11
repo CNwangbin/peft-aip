@@ -12,10 +12,11 @@ from collections import OrderedDict
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 import torch.distributed as dist
+import pytorch_warmup as warmup
 
 from dataset import EsmDataset
-from models import FineTuneESM
-from utils import set_seed, get_train_step, save_checkpoint, load_model_checkpoint, update_summary
+from models import FineTuneESM, PeftESM
+from utils import set_seed, get_train_step, save_checkpoint, load_model_checkpoint, update_summary, print_trainable_parameters
 from metrics import AverageMeter, compute_metrics
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -31,11 +32,21 @@ parser.add_argument('-c',
 parser = argparse.ArgumentParser(
     description='ESM linear head finetune classification trainning config')
 
+parser.add_argument('-peft',
+                    '--is-peft',
+                    default=False,
+                    type=bool,
+                    help='whether to use peft model')
 parser.add_argument('-nl',
                     '--num-layers',
                     default=0,
                     type=int,
                     help='number of layers used in finetuning of esm model')
+parser.add_argument('-rmt',
+                    '--remove-top-layers',
+                    default=0,
+                    type=int,
+                    help='number of top layers to remove')
 parser.add_argument('-pm',
                     '--pretrain-model',
                     default='esm2_t33_650M_UR50D',
@@ -46,6 +57,36 @@ parser.add_argument('-pm',
                             'esm2_t33_650M_UR50D',
                             'esm2_t36_3B_UR50D',
                             'esm2_t48_15B_UR50D',))
+parser.add_argument('-nlora',
+                    '--num-end-lora-layers',
+                    default=0,
+                    type=int,
+                    help='number of layers used in lora finetuning')
+parser.add_argument('-nr',
+                    '--num-lora-r',
+                    default=8,
+                    type=int,
+                    help='number of lora r')
+parser.add_argument('-na',
+                    '--num-lora-alpha',
+                    default=8,
+                    type=int,
+                    help='number of lora alpha')
+parser.add_argument('-im',
+                    '--inference-mode',
+                    default=False,
+                    type=bool,
+                    help='inference mode')
+parser.add_argument('-ld',
+                    '--lora-dropout',
+                    default='0.0',
+                    type=str,
+                    help='lora dropout')
+parser.add_argument('-bias',
+                    '--bias',
+                    default='none',
+                    type=str,
+                    help='bias')
 parser.add_argument('-train',
                     '--train-path',
                     default='data/data_AIP-MDL/train_df.pkl',
@@ -61,11 +102,6 @@ parser.add_argument('-test',
                     default='data/data_AIP-MDL/test_df.pkl',
                     type=str,
                     help='path of test data')
-parser.add_argument('-m',
-                    '--model',
-                    metavar='MODEL',
-                    default='esm_finetune',
-                    help='model architecture')
 parser.add_argument('--resume',
                     default=None,
                     type=str,
@@ -95,8 +131,8 @@ parser.add_argument('-b',
                     help='mini-batch size (default: 32) per gpu')
 parser.add_argument('-lr',
                     '--learning-rate',
-                    default=3e-5,
-                    type=float,
+                    default='3e-5',
+                    type=str,
                     metavar='LR',
                     help='initial learning rate',
                     dest='lr')
@@ -108,13 +144,13 @@ parser.add_argument('-mlr',
                     help='minimal learning rate',)
 parser.add_argument(
     '--lr-schedule',
-    default='exponential',
+    default='cosine',
     type=str,
     metavar='SCHEDULE',
-    choices=[None, 'exponential'],
+    choices=[None, 'cosine', 'exponential'],
     help='Type of LR schedule: {}, {}'.format(None, 'exponential'))
 parser.add_argument('--gamma',
-                    default=0.95,
+                    default=0.6,
                     type=float,
                     help='exponential learning rate decay factor')
 parser.add_argument('--optimizer',
@@ -133,6 +169,10 @@ parser.add_argument('-wd',
                     metavar='W',
                     help='weight decay (default: 0.0)',
                     dest='weight_decay')
+parser.add_argument('--warmup_period',
+                    default=100,
+                    type=int,
+                    help='warmup period, if > 0, use linear warmup')
 parser.add_argument(
     '--no-checkpoints',
     action='store_false',
@@ -160,7 +200,7 @@ parser.add_argument('--experiment', default='peft-aip', type=str)
 parser.add_argument('--patience',
                     default=2,
                     type=int,
-                    help='patience of loss')
+                    help='patience of evaluation Accuracy metric')
 parser.add_argument('--evaluate',
                     dest='evaluate',
                     action='store_true',
@@ -210,6 +250,11 @@ def main(args):
     print('log to wandb')
     wandb.init(project=args.experiment, config=args, entity='cnwangbi')
     set_seed(args.seed)
+
+    if args.is_peft:
+        logger.info('Using Parameter Efficient Fine-Tuning ESM model')
+    else:
+        logger.info('Using directly finetune ESM model')
 
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
@@ -270,8 +315,37 @@ def main(args):
         collate_fn=test_dataset.collate_fn,
     )
 
-    # model 
-    model = FineTuneESM(args.num_layers, args.pretrain_model)
+    # PEFT-SP using LoRA
+    if args.num_end_lora_layers > 0:
+        logger.info('Using PeftESM model')
+        model = PeftESM(num_end_lora_layers = args.num_end_lora_layers,
+                        num_lora_r = args.num_lora_r,
+                        num_lora_alpha = args.num_lora_alpha,
+                        inference_mode = args.inference_mode,
+                        lora_dropout = args.lora_dropout,
+                        bias = args.bias,
+                        pretrained_model_name = args.pretrain_model,
+                        remove_top_layers = args.remove_top_layers)
+
+    else:
+        # firectly finetune esm model 
+        logger.info('Using FineTuneESM model')
+        model = FineTuneESM( num_layers=args.num_layers, 
+                            pretrained_model_name=args.pretrain_model, 
+                            remove_top_layers=args.remove_top_layers)
+
+    logger.info(print_trainable_parameters(model))
+    logger.info(model)
+
+    logger.info("**********************************")
+    logger.info("Trainbel parameters:")
+    total_trainable_params = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info("%s, %s", name, str(param.data.shape))
+            total_trainable_params += np.prod(param.data.shape)
+    logger.info("**********************************")
+    logger.info("Total trainable parameters: %d", total_trainable_params)
 
     # optimizer and lr policy
     if args.optimizer == 'adamw':
@@ -293,16 +367,24 @@ def main(args):
 
     if args.lr_schedule == None:
         lr_schedule = None
+    elif args.lr_schedule == 'cosine':
+        lr_schedule = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=args.min_learning_rate)
     elif args.lr_schedule == 'exponential':
         lr_schedule = optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.gamma)
     else:
         print(f'lr_schedule {args.lr_schedule} is not implemented.')
 
+    if args.warmup_period > 0:
+        warmup_period = 100
+        warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_period)
+    else:
+        warmup_scheduler = None
+
     model.cuda()
 
     if args.resume is not None:
         if args.local_rank == 0:
-            model_state, optimizer_state = load_model_checkpoint(args.resume)
+            model_state, _ = load_model_checkpoint(args.resume)
             model.load_state_dict(model_state)
 
     scaler = torch.cuda.amp.GradScaler(
@@ -366,7 +448,9 @@ def main(args):
                save_checkpoints=True,
                output_dir=args.output_dir,
                log_wandb=True,
-               log_interval=args.log_interval)
+               log_interval=args.log_interval,
+               warmup_scheduler=warmup_scheduler,
+               warmup_period=warmup_period)
     logger.info('Training ended, start testing...')
 
     model_state, _ = load_model_checkpoint(os.path.join(args.output_dir, 'model_best.pth.tar'))
@@ -375,8 +459,6 @@ def main(args):
 
     test_metrics = evaluate(model, test_loader, args.amp, logger, args.log_interval)
     logger.info('Test: %s' % (test_metrics))
-    if args.log_wandb:
-        wandb.log(test_metrics)
     logger.info('Experiment ended.')
 
 def train(model,
@@ -387,7 +469,10 @@ def train(model,
           use_amp,
           epoch,
           logger,
-          log_interval=1):
+          log_interval=1,
+          warmup_scheduler=None,
+          warmup_period=0,
+          lr_scheduler=None):
     batch_time_m = AverageMeter('Time', ':6.3f')
     data_time_m = AverageMeter('Data', ':6.3f')
     losses_m = AverageMeter('Loss', ':.4e')
@@ -412,6 +497,11 @@ def train(model,
         data_time_m.update(data_time)
         losses_m.update(loss.item(), batch_size)
 
+        if lr_scheduler is not None:
+            if warmup_scheduler is not None:
+                with warmup_scheduler.dampening():
+                    if warmup_scheduler.last_step + 1 >= warmup_period:
+                        lr_scheduler.step()
         end = time.time()
         if (idx % log_interval == 0) or (idx == steps_per_epoch - 1):
             if not torch.distributed.is_initialized(
@@ -522,7 +612,9 @@ def train_loop(model,
                save_checkpoints=True,
                output_dir='./',
                log_wandb=True,
-               log_interval=10):
+               log_interval=10,
+               warmup_scheduler=None,
+               warmup_period=0):
     if early_stopping_patience > 0:
         epochs_since_improvement = 0
 
@@ -536,7 +628,7 @@ def train_loop(model,
         if not skip_training:
             train_metrics = train(model, train_loader, optimizer, scaler,
                                   gradient_accumulation_steps, use_amp, epoch,
-                                  logger, log_interval)
+                                  logger, log_interval, warmup_scheduler, warmup_period=warmup_period, lr_scheduler=lr_scheduler)
 
             logger.info('[Epoch %d] training: %s' % (epoch + 1, train_metrics))
 
@@ -580,8 +672,6 @@ def train_loop(model,
                 epochs_since_improvement = 0
             if epochs_since_improvement >= early_stopping_patience:
                 break
-        if lr_scheduler is not None:
-            lr_scheduler.step()
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -605,7 +695,13 @@ if __name__ == '__main__':
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     model_short = args.pretrain_model.split('_')[-2]
-    task_name = args.model + '_' + model_short + '_' + f'finetune{args.num_layers}'
+    if args.is_peft:
+        task_name = 'esm_lora' + '_' + model_short + '_' + f'lr{args.learning_rate}' + '_' + f'rmt{args.remove_top_layers}' + '_' + f'r{args.num_lora_r}a{args.num_lora_alpha}l{args.num_end_lora_layers}d{args.lora_dropout}'
+    else:
+        task_name = 'esm_finetune' + '_' + model_short + '_' + f'lr{args.learning_rate}' + '_' + f'rmt{args.remove_top_layers}' + '_' + f'f{args.num_layers}'
+    
+    args.learning_rate = float(args.learning_rate)
+    args.lora_dropout = float(args.lora_dropout)
     args.output_dir = os.path.join(args.output_dir, task_name)
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
